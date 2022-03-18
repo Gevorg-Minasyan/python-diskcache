@@ -89,6 +89,14 @@ EVICTION_POLICY = {
         'get': 'access_time = {now}',
         'cull': 'SELECT {fields} FROM Cache ORDER BY access_time LIMIT ?',
     },
+    'least-recently-used-custom': {
+        'init': (
+            'CREATE INDEX IF NOT EXISTS Cache_access_time ON'
+            ' Cache (access_time)'
+        ),
+        'get': None,
+        'cull': 'SELECT {fields} FROM Cache',
+    },
     'least-frequently-used': {
         'init': (
             'CREATE INDEX IF NOT EXISTS Cache_access_count ON'
@@ -912,16 +920,36 @@ class Cache:
         if select_policy is None or self.volume() < self.size_limit:
             return
 
-        select_filename = select_policy.format(fields='filename', now=now)
-        rows = sql(select_filename, (cull_limit,)).fetchall()
+        select_filename = select_policy.format(fields='rowid,filename', now=now)
+        rows_to_delete = None
+        if self.eviction_policy == "least-recently-used-custom":
+            rows = sql(select_filename).fetchall()
 
-        if rows:
+            def last_acc_date(filen):
+                full_path = op.join(self._disk._directory, filen)
+                return os.stat(full_path).st_atime
+
+            last_acc_dict = {f: last_acc_date(f[1]) for f in rows}
+            ordered_rows = sorted(last_acc_dict, key=lambda x: last_acc_dict[x])
+            rows_to_delete = ordered_rows[:cull_limit]
+        else:
+            rows = sql(select_filename, (cull_limit,)).fetchall()
+
+        if rows_to_delete and self.eviction_policy == "least-recently-used-custom":
+            delete = 'DELETE FROM Cache WHERE rowid IN (%s)' % (
+                ','.join([str(i[0]) for i in rows_to_delete])
+            )
+            sql(delete)
+
+            for (_,filename) in rows_to_delete:
+                cleanup(filename)
+        else:
             delete = 'DELETE FROM Cache WHERE rowid IN (%s)' % (
                 select_policy.format(fields='rowid', now=now)
             )
             sql(delete, (cull_limit,))
 
-            for (filename,) in rows:
+            for (_,filename) in rows:
                 cleanup(filename)
 
     def touch(self, key, expire=None, retry=False):
@@ -2452,3 +2480,4 @@ class Cache:
 
         setattr(self, key, value)
         return value
+
